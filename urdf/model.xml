@@ -76,8 +76,12 @@
   </worldbody>
 
   <actuator>
-    <!-- Effort limit 0.4 N*m, velocity envelope 196 rad/s from the URDF
-         joint limits (motor holding torque / firmware step-rate cap). -->
-    <motor name="base_to_arm_motor" joint="base_to_arm" ctrlrange="-0.4 0.4" />
+    <!-- Position actuator: ctrl is a target angle in radians, matching the
+         base_to_arm joint's own range (+-135 deg hard stops from the URDF).
+         Control-tab value and Joint-tab qpos now read the same number once
+         the arm settles (kp is the position gain  raise it for a stiffer,
+         faster response, lower it if it overshoots/oscillates). -->
+    <position name="base_to_arm_motor" joint="base_to_arm"
+              ctrlrange="-2.35619449 2.35619449" kp="5" kv="0.05" />
   </actuator>
 </mujoco>

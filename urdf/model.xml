@@ -1,0 +1,83 @@
+<mujoco model="inverted_pendulum">
+  <!--
+    Converted from inverted_pendulum.urdf (Onshape export).
+
+    Frame notes carried over from the URDF:
+    - base_to_arm origin: xyz (0 0 0.075), rpy (0 0 -1.57079) -> quat below
+    - arm_to_pendulum origin: xyz (0.062 0 0.014), axis +x (arm's radial axis)
+    - pendulum visual mesh needs rpy (pi 0 -pi/2) to bring the mesh's +y
+      bearing axis onto the joint's +x, and mesh +z onto -z (rod hangs at
+      joint angle zero)  see URDF comment on the pendulum link.
+    - base_to_lid is a fixed offset (0 0 0.070); lid has no inertial in the
+      source URDF (visual-only), so it is fused into base as extra geometry
+      here rather than kept as a separate massless body.
+
+    NOT a copy of pendulum_env.build_mjcf: that model omits base/lid, and
+    places the arm along +x at motor-zero instead of -y. This file mirrors
+    the URDF's own frames instead, for CAD-accurate visualization.
+  -->
+
+  <compiler angle="radian" meshdir="/home/shourya/rl2/meshes" autolimits="true" />
+
+  <option gravity="0 0 -9.81" />
+
+  <default>
+    <joint damping="0.0001" frictionloss="0" />
+    <geom contype="0" conaffinity="0" />
+  </default>
+
+  <asset>
+    <material name="enclosure" rgba="0.25 0.25 0.28 1" />
+    <material name="arm_blue" rgba="0.4 0.6 0.8 1" />
+    <material name="pendulum_red" rgba="0.8 0.4 0.4 1" />
+
+    <mesh name="base_mesh" file="base.stl" scale="0.001 0.001 0.001" />
+    <mesh name="lid_mesh" file="lid.stl" scale="0.001 0.001 0.001" />
+    <mesh name="arm_mesh" file="arm.stl" scale="0.001 0.001 0.001" />
+    <mesh name="pendulum_mesh" file="pendulum.stl" scale="0.001 0.001 0.001" />
+  </asset>
+
+  <worldbody>
+    <light directional="true" diffuse="0.6 0.6 0.6" pos="0 0 1.5" dir="0 0 -1" />
+
+    <!-- Base: fixed to world origin -->
+    <body name="base" pos="0 0 0">
+      <geom type="mesh" mesh="base_mesh" material="enclosure" />
+
+      <!-- Lid: fixed offset from base, no separate inertial in source URDF,
+           so it is welded on as a second visual geom rather than a body. -->
+      <geom type="mesh" mesh="lid_mesh" material="enclosure" pos="0 0 0.070" />
+
+      <!-- Arm: revolute about world/base +z, offset (0 0 0.075), yawed -90deg -->
+      <body name="arm" pos="0 0 0.075" quat="0.70710678 0 0 -0.70710678">
+        <joint name="base_to_arm" type="hinge" axis="0 0 1"
+               range="-2.35619449 2.35619449"
+               limited="true"
+               damping="0" />
+        <inertial pos="0.041 0 0.011"
+                  mass="0.026"
+                  fullinertia="0.00000429 0.00001756 0.0000173 0 -0.00000175 0" />
+        <geom type="mesh" mesh="arm_mesh" material="arm_blue" />
+
+        <!-- Pendulum: continuous hinge about the arm's own +x (radial) axis,
+             mounted at the arm's outboard bearing bore. -->
+        <body name="pendulum" pos="0.062 0 0.014">
+          <joint name="arm_to_pendulum" type="hinge" axis="1 0 0" limited="false" />
+          <inertial pos="0 0 -0.051"
+                    mass="0.014"
+                    fullinertia="0.00000806 0.00000855 0.00000061 0 0 0.00000019" />
+          <!-- Visual mesh rotation: rpy (pi, 0, -pi/2) from URDF, bringing
+               mesh +y (bearing axis) onto joint +x and mesh +z onto -z. -->
+          <geom type="mesh" mesh="pendulum_mesh" material="pendulum_red"
+                euler="3.14159265 0 -1.57079633" />
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- Effort limit 0.4 N*m, velocity envelope 196 rad/s from the URDF
+         joint limits (motor holding torque / firmware step-rate cap). -->
+    <motor name="base_to_arm_motor" joint="base_to_arm" ctrlrange="-0.4 0.4" />
+  </actuator>
+</mujoco>

@@ -10,7 +10,7 @@ Two hinge joints:
 
 Task: swing the pendulum up from hanging straight down (angle = pi, or
 equivalently -pi) to balanced upright (angle = 0) and hold it there, by
-only ever commanding the arm's target angle.
+commanding relative delta-position changes for the arm.
 
 Requires: inverted_pendulum.xml (and its meshes/ dir) in the same directory,
 or pass an explicit xml_path.
@@ -35,10 +35,10 @@ class InvertedPendulumEnv(gym.Env):
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
 
-        self.frame_skip = 4          # sim dt in the XML is unset -> default 0.002s; 4*0.002=0.008s control dt
+        self.frame_skip = 4          # sim dt default 0.002s; 4*0.002 = 0.008s control dt
         self.max_steps = 1000
-        self.upright_tolerance = 0.15   # rad, ~8.6 deg, counted as "balanced"
-        self.upright_hold_steps = 100   # steps balanced before success termination
+        self.upright_tolerance = 0.15   # rad (~8.6 deg), counted as "balanced"
+        self.upright_hold_steps = 625   # steps balanced before counted as success (625 * 0.008s = 5s)
 
         # Joint / actuator indices, resolved once
         self.arm_joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "base_to_arm")
@@ -48,19 +48,18 @@ class InvertedPendulumEnv(gym.Env):
         self.arm_dof_adr = self.model.jnt_dofadr[self.arm_joint_id]
         self.pend_dof_adr = self.model.jnt_dofadr[self.pend_joint_id]
 
-        self.arm_limit = 2.35619449  # rad, matches the XML's hardware stop range
+        self.arm_limit = 2.35619449  # rad (+-135 deg hardware stop range)
 
-        # --- Action: target arm angle (rad), fed straight to the position actuator ---
+        # --- Relative Action Settings ---
+        self.max_delta = 0.10  # Max target angle delta per step (rad, ~5.7 deg)
+
+        # --- Action: Normalized [-1.0, 1.0], representing delta movement ---
         self.action_space = spaces.Box(
-            low=np.array([-self.arm_limit], dtype=np.float32),
-            high=np.array([self.arm_limit], dtype=np.float32),
+            low=-1.0, high=1.0, shape=(1,), dtype=np.float32
         )
 
         # --- Observation: [arm_angle, arm_vel, cos(pend), sin(pend), pend_vel] ---
-        # cos/sin of the pendulum angle instead of the raw angle avoids the
-        # wraparound discontinuity at +-pi (the hanging-down rest position),
-        # which would otherwise sit right at the edge of the observation range.
-        high = np.array([self.arm_limit, 30.0, 1.0, 1.0, 50.0], dtype=np.float32)
+        high = np.array([self.arm_limit, 60.0, 1.0, 1.0, 150.0], dtype=np.float32)
         self.observation_space = spaces.Box(low=-high, high=high, dtype=np.float32)
 
         self.render_mode = render_mode
@@ -78,10 +77,11 @@ class InvertedPendulumEnv(gym.Env):
         arm_vel = self.data.qvel[self.arm_dof_adr]
         pend_angle = self._pendulum_angle_wrapped()
         pend_vel = self.data.qvel[self.pend_dof_adr]
-        return np.array(
+        obs = np.array(
             [arm_angle, arm_vel, np.cos(pend_angle), np.sin(pend_angle), pend_vel],
             dtype=np.float32,
         )
+        return np.clip(obs, self.observation_space.low, self.observation_space.high)
 
     def _get_info(self):
         return {
@@ -97,7 +97,9 @@ class InvertedPendulumEnv(gym.Env):
         # Start hanging down (pi) with a small random perturbation, arm centered.
         self.data.qpos[self.arm_qpos_adr] = self.np_random.uniform(-0.1, 0.1)
         self.data.qpos[self.pend_qpos_adr] = np.pi + self.np_random.uniform(-0.05, 0.05)
-        self.data.ctrl[0] = 0.0
+        
+        # Initialize target control position to current arm position
+        self.data.ctrl[0] = self.data.qpos[self.arm_qpos_adr]
 
         mujoco.mj_forward(self.model, self.data)
         self.step_count = 0
@@ -105,45 +107,87 @@ class InvertedPendulumEnv(gym.Env):
         return self._get_obs(), self._get_info()
 
     def step(self, action):
-        target_angle = float(np.clip(action[0], -self.arm_limit, self.arm_limit))
+        # --------------------------------------------------------
+        # Action: Relative Delta-Position Control
+        # --------------------------------------------------------
+        a = float(np.clip(action[0], -1.0, 1.0))
+        delta_theta = a * self.max_delta
+        
+        current_theta = float(self.data.qpos[self.arm_qpos_adr])
+        target_angle = float(
+            np.clip(current_theta + delta_theta, -self.arm_limit, self.arm_limit)
+        )
+
         self.data.ctrl[0] = target_angle
 
+        # Run MuJoCo simulation
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
 
-        if not np.all(np.isfinite(self.data.qpos)) or not np.all(np.isfinite(self.data.qvel)):
+        # --------------------------------------------------------
+        # Check simulation stability
+        # --------------------------------------------------------
+        if (
+            not np.all(np.isfinite(self.data.qpos))
+            or not np.all(np.isfinite(self.data.qvel))
+        ):
             obs = np.zeros(self.observation_space.shape, dtype=np.float32)
             return obs, -50.0, True, False, {"diverged": True}
 
         self.step_count += 1
+
+        # --------------------------------------------------------
+        # State & Reward Computation
+        # --------------------------------------------------------
         obs = self._get_obs()
-        arm_angle, arm_vel, cos_p, sin_p, pend_vel = obs
-        pend_angle = np.arctan2(sin_p, cos_p)
 
-        # Reward: upright (angle near 0) and slow (low angular velocity) is best.
-        # cos_p alone ranges [-1, 1] -> 1 at upright, -1 hanging down; scale it
-        # as the main shaping term, penalize angular velocity and large arm
-        # excursions (keeps the arm from just spinning to fling the pendulum up).
-        reward = cos_p - 0.01 * (pend_vel ** 2) - 0.001 * (arm_vel ** 2) - 0.01 * (arm_angle ** 2)
+        theta = float(self.data.qpos[self.arm_qpos_adr])
+        theta_dot = float(self.data.qvel[self.arm_dof_adr])
+        alpha = float(self._pendulum_angle_wrapped())
+        alpha_dot = float(self.data.qvel[self.pend_dof_adr])
 
-        is_balanced = abs(pend_angle) < self.upright_tolerance
+        # Continuous Shaped Reward:
+        # Penalizes magnitude of action step 'a' instead of absolute target angle
+        reward = (
+            2.0 * np.cos(alpha)
+            + 0.2 * np.cos(theta)
+            - 0.005 * (alpha_dot ** 2)
+            - 0.001 * (theta_dot ** 2)
+            - 0.01 * (a ** 2)
+        )
+
+        # --------------------------------------------------------
+        # Balanced & Terminal Detection
+        # --------------------------------------------------------
+        is_balanced = abs(alpha) < self.upright_tolerance
         self.balanced_steps = self.balanced_steps + 1 if is_balanced else 0
 
-        hit_arm_limit = abs(arm_angle) >= self.arm_limit - 1e-3
-        success = self.balanced_steps >= self.upright_hold_steps
+        hit_arm_limit = abs(theta) >= self.arm_limit - 1e-3
+        just_reached_hold = self.balanced_steps == self.upright_hold_steps
         truncated = self.step_count >= self.max_steps
 
-        if success:
+        # Additional environment rewards/penalties
+        if just_reached_hold:
             reward += 50.0
+
         if hit_arm_limit:
-            reward -= 5.0  # discourage slamming into hardware stops, but don't end the episode over it
+            reward -= 5.0
 
-        terminated = bool(success)
+        terminated = False
 
+        # --------------------------------------------------------
+        # Rendering
+        # --------------------------------------------------------
         if self.render_mode == "human":
             self.render()
 
-        return obs, float(reward), terminated, bool(truncated), self._get_info()
+        return (
+            obs,
+            float(reward),
+            terminated,
+            bool(truncated),
+            self._get_info()
+        )
 
     def render(self):
         if self.render_mode is None:
@@ -154,7 +198,7 @@ class InvertedPendulumEnv(gym.Env):
         frame = self._renderer.render()
         if self.render_mode == "rgb_array":
             return frame
-        return frame  # "human": no live window headless; use mujoco.viewer.launch_passive locally
+        return frame
 
     def close(self):
         if self._renderer is not None:
@@ -163,7 +207,7 @@ class InvertedPendulumEnv(gym.Env):
 
 
 if __name__ == "__main__":
-    env = InvertedPendulumEnv(xml_path="/home/shourya/rl2/urdf/model.xml")
+    env = InvertedPendulumEnv()
     obs, info = env.reset(seed=0)
     total_reward = 0.0
 
